@@ -1766,19 +1766,20 @@ async function main() {
     return { ...sent, key, file: resolved.path, via: resolved.via, verification, readback: readbackText };
   }
 
-  // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
+  // 发送一个收藏表情：优先调用 SnowLuma 原生 send_custom_face，保留 QQ 的表情显示样式。
+  // 原生接口不支持 at；带 atUserId 时保留旧的图片段路径，避免丢失点名语义。
   async function sendStickerV2(key, stickerRef, options = {}) {
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
     const synced = await syncStickerLibrary(true);
     const entry = findSticker(synced?.entries ?? stickerEntries, stickerRef);
     if (!entry) throw new Error(`找不到表情 ${stickerRef}，请先用 qq_list_stickers 获取有效 id`);
-    const url = entry.url;
-    if (!url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
     const [kind, id] = key.split(':');
     const segments = [];
     const replyToMessageId = options.replyToMessageId;
     const atUserId = options.atUserId;
+    const hasAtUserId = atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '';
+    const useNativeFace = !hasAtUserId;
     // 仿真常识：一条消息只能是一张表情，不能在同一气泡里附带文字说明。
     // 想说的话请用 qq_send_message / qq_reply 作为单独气泡发送。
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
@@ -1786,21 +1787,15 @@ async function main() {
       if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
       segments.push({ type: 'reply', data: { id: rid } });
     }
-    if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
+    if (hasAtUserId) {
       const at = String(atUserId).trim();
       if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
       segments.push({ type: 'at', data: { qq: at } });
     }
-    // 在桥接内完成带 DNS 固定、逐跳校验和大小限制的下载；不能把 URL 交给网关重新抓取。
-    let image;
-    try {
-      image = await safeFetchBuffer(url);
-    } catch (error) {
-      throw new Error(`表情 ${entry.id} 的图片地址不合法，已拒绝发送：${error?.message ?? error}`);
-    }
-    segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
-    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
-    const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
+    const nativeId = entry.id || entry.md5;
+    if (useNativeFace && !nativeId) throw new Error(`表情 ${entry.id || stickerRef} 没有可用的 emoji_id 或 MD5`);
+    const url = entry.url;
+    if (!useNativeFace && !url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
     // 与文本发送共用 sendChain，保证“先文字后表情”的真人顺序不被并发工具调用打乱。
     let sendResolve;
@@ -1814,6 +1809,30 @@ async function main() {
         // 真人发表情前通常会有短暂停顿，避免“文字刚发完表情立刻跟上”的机械感。
         await sleep(randInt(800, 2000));
         assertSendAllowed();
+        if (useNativeFace) {
+          const nativeParams = kind === 'private'
+            ? { emoji_id: nativeId, user_id: Number(id) }
+            : { emoji_id: nativeId, group_id: Number(id) };
+          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
+            nativeParams.reply_to = Number(String(replyToMessageId).trim());
+          }
+          const body = await bot.request('send_custom_face', nativeParams, { timeoutMs: 15000 });
+          if (!body || body.status !== 'ok' || body.retcode !== 0) {
+            throw new Error(`OneBot send_custom_face 失败: ${body?.wording || body?.retcode || 'unknown'}`);
+          }
+          sendResolve(body.data);
+          return;
+        }
+        // 带 @ 时原生接口无法组合消息，使用受限图片路径保留点名功能。
+        let image;
+        try {
+          image = await safeFetchBuffer(url);
+        } catch (error) {
+          throw new Error(`表情 ${entry.id} 的图片地址不合法，已拒绝发送：${error?.message ?? error}`);
+        }
+        segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
+        const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+        const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
         const res = await fetch(`${httpUrl}/${action}`, {
           method: 'POST',
           headers: {
@@ -2197,12 +2216,13 @@ async function main() {
   function withSlangContext(promptText) {
     const now = new Date();
     const timeLine = `【当前时间】${now.toLocaleString('zh-CN', { hour12: false })}（${Intl.DateTimeFormat().resolvedOptions().timeZone}）`;
-    const parts = [timeLine];
+    const parts = [];
     if (cfg.slang?.enabled !== false) {
       const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
       if (block) parts.push(block);
     }
-    return parts.join('\n\n') + '\n\n' + promptText;
+    parts.push(promptText, timeLine);
+    return parts.filter(Boolean).join('\n\n');
   }
 
   if (!cfg.allow.private.length && !cfg.allow.groups.length && cfg.allowAllWhenEmpty) {
