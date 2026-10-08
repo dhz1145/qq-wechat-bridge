@@ -7304,6 +7304,9 @@ async function main() {
         continue;
       }
       if (!media || typeof media !== 'object') continue;
+      if (media.quotedMessageId) {
+        parts.push({ type: 'text', text: `[以下图片/表情${index}来自引用消息 ${media.quotedMessageId}]` });
+      }
       if (media.kind === 'face') {
         const face = await fetchFaceMedia(media);
         if (face.buffer) {
@@ -7393,9 +7396,9 @@ async function main() {
   function mediaHintFor(key, messageRef, mediaList) {
     if (!Array.isArray(mediaList) || mediaList.length === 0 || !messageRef) return '';
     if (currentMode === 'reserved2') {
-      return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
+      return `\n【图片/表情】本条消息及其引用包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
     }
-    return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。`;
+    return `\n【图片/表情】本条消息及其引用包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。`;
   }
 
   function findMessageMedia(key, ref) {
@@ -8965,8 +8968,8 @@ async function main() {
     }
   }
 
-  // QQ 引用/回复解析缓存：messageId -> { sender, text, ts }，避免每条引用都调一次 OneBot API。
-  const replyInfoCache = new Map(); // `kind:convId:messageId` -> { info, ts }
+  // QQ 引用/回复解析缓存：同一引用的文字和媒体共用一次 OneBot 查询。
+  const replyInfoCache = new Map(); // `kind:convId:messageId` -> { info, media, ts }
   const REPLY_INFO_TTL_MS = 10 * 60 * 1000;
   const REPLY_NEGATIVE_TTL_MS = 5 * 1000; // 失败/归属缺失只短缓存，避免一次瞬时抖动导致长时间解析失败
   function pruneReplyInfoCache() {
@@ -8980,11 +8983,13 @@ async function main() {
       if (oldestKey !== undefined) replyInfoCache.delete(oldestKey);
     }
   }
-  async function resolveReplyInfo(kind, convId, messageId, selfId = null) {
+  async function resolveReplyInfo(kind, convId, messageId, selfId = null, includeMedia = false) {
     pruneReplyInfoCache();
     const cacheKey = `${kind}:${String(convId)}:${String(messageId)}`;
     const hit = replyInfoCache.get(cacheKey);
-    if (hit && Date.now() - hit.ts < (hit.info ? REPLY_INFO_TTL_MS : REPLY_NEGATIVE_TTL_MS)) return hit.info;
+    if (hit && Date.now() - hit.ts < (hit.info ? REPLY_INFO_TTL_MS : REPLY_NEGATIVE_TTL_MS)) {
+      return includeMedia && hit.info ? { ...hit.info, media: hit.media } : hit.info;
+    }
     try {
       const numericId = Number(messageId);
       if (!Number.isSafeInteger(numericId)) {
@@ -9031,14 +9036,17 @@ async function main() {
         resolveAtName: kind === 'group' ? (qq) => resolveGroupMemberName(convId, qq) : null,
         includeReply: false
       });
+      // 引用消息里的图片/表情不能只保留为「[图片]」占位符：调用方需要把
+      // 它们和当前消息的媒体一起登记，才能在多模态投递或按需图片工具中取到字节。
+      const media = extractMediaFromSegments(raw.message ?? []);
       const senderUserId = raw.sender?.user_id ?? raw.user_id ?? null;
       const info = {
         sender: String(sender ?? ''),
         text: String(text ?? '').slice(0, 200),
         userId: senderUserId != null ? String(senderUserId) : null
       };
-      replyInfoCache.set(cacheKey, { info, ts: Date.now() });
-      return info;
+      replyInfoCache.set(cacheKey, { info, media, ts: Date.now() });
+      return includeMedia ? { ...info, media } : info;
     } catch (error) {
       log('解析引用消息失败:', error?.message ?? error);
       replyInfoCache.set(cacheKey, { info: null, ts: Date.now() });
@@ -9097,6 +9105,25 @@ async function main() {
     return false;
   }
 
+  // 把当前消息引用目标里的媒体并入当前消息。引用段本身只提供 message id，
+  // 图片/表情元数据必须通过 get_msg 再取一次；resolveReplyInfo 已做会话归属校验并缓存。
+  async function extractReferencedMedia(message, kind, id, selfId = null) {
+    const media = [];
+    if (!Array.isArray(message)) return media;
+    const seen = new Set();
+    for (const seg of message) {
+      if (seg?.type !== 'reply' || seg.data?.id == null) continue;
+      const quotedMessageId = String(seg.data.id);
+      if (seen.has(quotedMessageId)) continue;
+      seen.add(quotedMessageId);
+      const info = await resolveReplyInfo(kind, id, quotedMessageId, selfId, true);
+      for (const item of Array.isArray(info?.media) ? info.media : []) {
+        media.push({ ...item, quotedMessageId });
+      }
+    }
+    return media;
+  }
+
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
   function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
     const st = getSocialV2State(key);
@@ -9106,7 +9133,8 @@ async function main() {
       kind: m?.kind === 'face' ? 'face' : 'image',
       file: m?.file ? String(m.file) : undefined,
       url: m?.url ? String(m.url) : undefined,
-      faceId: m?.faceId ? String(m.faceId) : undefined
+      faceId: m?.faceId ? String(m.faceId) : undefined,
+      ...(m?.quotedMessageId ? { quotedMessageId: String(m.quotedMessageId) } : {})
     })).filter((m) => m.kind === 'face' ? !!m.faceId : !!(m.file || m.url)) : [];
     const safeForwardIds = (Array.isArray(forwardIds) ? forwardIds : []).map(sanitizeForwardId).filter(Boolean);
     if (safeForwardIds.length) {
@@ -9882,6 +9910,8 @@ async function main() {
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
     const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
     const mediaList = extractMediaFromSegments(event.message ?? []);
+    const referencedMedia = await extractReferencedMedia(event.message ?? [], kind, id, event.self_id);
+    if (referencedMedia.length) mediaList.push(...referencedMedia);
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
     const refsToStore = [...new Set([messageRef, seqRef].filter(Boolean))];

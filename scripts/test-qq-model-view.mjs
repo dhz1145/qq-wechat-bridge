@@ -135,11 +135,19 @@ test('synthetic payload size comparison (characters, not measured token usage)',
 
 test('MCP validates/forwards read watermarks and wait purposes against an isolated local API', async () => {
   const requests = [];
+  const imageData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=';
   const api = http.createServer(async (req, res) => {
     let raw = '';
     for await (const chunk of req) raw += chunk;
     requests.push({ url: req.url, body: raw ? JSON.parse(raw) : null, token: req.headers['x-agent-token'] });
     res.writeHead(200, { 'content-type': 'application/json' });
+    if (req.url.startsWith('/api/images/message?')) {
+      res.end(JSON.stringify({ ok: true,
+        media: [{ kind: 'image', quotedMessageId: '-900' }],
+        images: [{ index: 1, kind: 'image', mimeType: 'image/png', data: imageData }]
+      }));
+      return;
+    }
     res.end(JSON.stringify({ ok: true, readThroughSeq: 21, messages: [shortMessage], accepted: raw ? JSON.parse(raw) : null }));
   });
   await new Promise((resolve, reject) => {
@@ -180,6 +188,15 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     assert.equal(data.readThroughSeq, 21);
     assert.equal('plain' in data.messages[0], false);
     assert.equal(readText, JSON.stringify(data));
+
+    const imageResult = await client.callTool({ name: 'qq_get_message_images', arguments: { ...common, messageId: '-1000' } });
+    assert.equal(imageResult.isError, undefined);
+    assert.deepEqual(imageResult.content.find(part => part.type === 'image'), {
+      type: 'image', mimeType: 'image/png', data: imageData
+    });
+    assert.match(imageResult.content.find(part => part.type === 'text').text, /引用消息 -900 的图片1/);
+    assert.equal(new URL(requests.at(-1).url, 'http://fixture').searchParams.get('messageId'), '-1000');
+    assert.equal(requests.at(-1).token, common.token);
 
     await client.callTool({ name: 'qq_get_unread_messages', arguments: { ...common, afterSeq: 0, limit: 100 } });
     assert.equal(new URL(requests.at(-1).url, 'http://fixture').searchParams.get('afterSeq'), '0');

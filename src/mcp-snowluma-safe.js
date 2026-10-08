@@ -886,7 +886,7 @@ server.tool(
 if (cfg.socialV2?.tools?.getImages !== false) {
   server.tool(
     'qq_get_message_images',
-    '获取指定 QQ 消息中的图片/表情，并直接以图像内容返回给模型（视觉模型可“看懂”）。当消息文本里出现 [图片]、[表情] 或 hasMedia=true 时调用。支持一条消息里的多张图片/表情；二代模式下必须携带会话令牌。',
+    '获取指定 QQ 消息及其引用消息中的图片/表情，并直接以图像内容返回给模型（视觉模型可“看懂”）。当消息文本里出现 [图片]、[表情]（包括引用中的占位符）或 hasMedia=true 时调用，传当前消息的 messageId/seq 即可。支持多张图片/表情，返回时标明引用来源；二代模式下必须携带会话令牌。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       messageId: z.union([z.number(), z.string()]).describe('要查看的消息 id（QQ 消息 id 可为负数；二代也可用本地 seq）'),
@@ -906,11 +906,13 @@ if (cfg.socialV2?.tools?.getImages !== false) {
         const content = [];
         const textParts = [];
         for (const img of images) {
+          const quotedMessageId = data.media?.[Number(img.index) - 1]?.quotedMessageId;
+          const source = quotedMessageId ? `引用消息 ${quotedMessageId} 的` : '';
           if (img?.data && img?.mimeType) {
-            textParts.push(`[${img.kind === 'face' ? '表情' : '图片'}${img.index ?? ''}${img.text ? ' ' + img.text : ''}]`);
+            textParts.push(`[${source}${img.kind === 'face' ? '表情' : '图片'}${img.index ?? ''}${img.text ? ' ' + img.text : ''}]`);
             content.push({ type: 'image', mimeType: img.mimeType, data: img.data });
           } else {
-            textParts.push(`[${img.kind === 'face' ? '表情' : '图片'}${img.index ?? ''}${img.text ? ' ' + img.text : '（获取失败）'}]`);
+            textParts.push(`[${source}${img.kind === 'face' ? '表情' : '图片'}${img.index ?? ''}${img.text ? ' ' + img.text : '（获取失败）'}]`);
           }
         }
         if (textParts.length) {
